@@ -10,6 +10,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 EXA_API_KEY = os.getenv("EXA_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 # Model Configuration
 LLM_MODEL = "gpt-4o-mini"

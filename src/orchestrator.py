@@ -1,207 +1,141 @@
-"""Main orchestrator for the Course Recommendation System."""
-
-from typing import Dict, List, Annotated, TypedDict
-from langgraph.graph import StateGraph, END
-from langchain.schema import HumanMessage, AIMessage
+import uuid
+from typing import List, Dict, Optional, Callable
+from langgraph.func import entrypoint, task
+from langchain.schema import AIMessage, HumanMessage
 from src.agents.student_profile_agent import StudentProfileAgent
 from src.agents.course_discovery_agent import CourseDiscoveryAgent
 from src.agents.course_suitability_agent import CourseSuitabilityAgent
 from src.agents.career_path_agent import CareerPathAgent
-from src.models.base_models import ConversationContext
+from langgraph.graph import add_messages
+from langgraph.types import interrupt
+from langgraph.checkpoint.memory import MemorySaver
 
-class GraphState(TypedDict):
-    """State maintained between nodes in the graph."""
-    context: ConversationContext
-    messages: List[Dict]
-    next_action: str
-    error: str | None
+def generate_uuid_from_text(text: str) -> str:
+    """Generate a consistent UUID from a string input."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, text))
 
-def create_agent_graph() -> StateGraph:
-    """Create the agent workflow graph.
+# Initialize agents once
+AGENTS = {
+    "profile": StudentProfileAgent().as_runnable(),
+    "discovery": CourseDiscoveryAgent().as_runnable(),
+    "suitability": CourseSuitabilityAgent().as_runnable(),
+    "career": CareerPathAgent().as_runnable(),
+}
+
+@task
+async def invoke_agent(agent_key: str, messages: List[Dict]) -> List[Dict]:
+    agent = AGENTS.get(agent_key)
+    if not agent:
+        raise ValueError(f"Unknown agent key: {agent_key}")
+    response = await agent.ainvoke({"messages": messages})  # <- this is the fix
+    return response.get("messages", [])
+
+checkpointer = MemorySaver()
+
+@entrypoint(checkpointer=checkpointer)
+async def orchestrate_conversation(
+    new_message: Dict,
+    history: Optional[List[Dict]] = None,
+) -> List[Dict]:
+    """
+    Orchestrates the multi-turn conversation by delegating to agents based on tool calls.
+    
+    Args:
+        new_message: Incoming user or system message dict
+        history: Previous messages in the conversation
     
     Returns:
-        StateGraph: Configured workflow graph
+        List of messages from the last invoked agent or conversation end.
     """
-    # Initialize agents
-    profile_agent = StudentProfileAgent()
-    discovery_agent = CourseDiscoveryAgent()
-    suitability_agent = CourseSuitabilityAgent()
-    career_agent = CareerPathAgent()
-    
-    # Create the graph
-    workflow = StateGraph(GraphState)
-    
-    # Define agent nodes
-    async def profile_node(state: GraphState) -> GraphState:
-        """Process student profile collection."""
-        try:
-            context = state["context"]
-            response = await profile_agent.process(context)
-            state["next_action"] = response.next_action
-            state["messages"].append({"role": "assistant", "content": response.message})
-            state["error"] = None
-        except Exception as e:
-            state["error"] = f"Error in profile collection: {str(e)}"
-            state["next_action"] = "retry_profile"
-        return state
-    
-    async def discovery_node(state: GraphState) -> GraphState:
-        """Process course discovery."""
-        try:
-            context = state["context"]
-            response = await discovery_agent.process(context)
-            state["next_action"] = response.next_action
-            state["messages"].append({"role": "assistant", "content": response.message})
-            state["error"] = None
-        except Exception as e:
-            state["error"] = f"Error in course discovery: {str(e)}"
-            state["next_action"] = "retry_discovery"
-        return state
-    
-    async def suitability_node(state: GraphState) -> GraphState:
-        """Process course suitability validation."""
-        try:
-            context = state["context"]
-            response = await suitability_agent.process(context)
-            state["next_action"] = response.next_action
-            state["messages"].append({"role": "assistant", "content": response.message})
-            state["error"] = None
-        except Exception as e:
-            state["error"] = f"Error in suitability check: {str(e)}"
-            state["next_action"] = "retry_suitability"
-        return state
-    
-    async def career_node(state: GraphState) -> GraphState:
-        """Process career guidance."""
-        try:
-            context = state["context"]
-            response = await career_agent.process(context)
-            state["next_action"] = response.next_action
-            state["messages"].append({"role": "assistant", "content": response.message})
-            state["error"] = None
-        except Exception as e:
-            state["error"] = f"Error in career guidance: {str(e)}"
-            state["next_action"] = "retry_career"
-        return state
-    
-    async def end_node(state: GraphState) -> GraphState:
-        """End the conversation."""
-        state["messages"].append({
-            "role": "assistant", 
-            "content": "Thank you for using the Course Recommendation System. Is there anything else you'd like to know?"
-        })
-        return state
-    
-    # Add nodes to the graph
-    workflow.add_node("profile", profile_node)
-    workflow.add_node("discovery", discovery_node)
-    workflow.add_node("suitability", suitability_node)
-    workflow.add_node("career", career_node)
-    workflow.add_node("end", end_node)
-    
-    # Define conditional edges
-    def should_continue_profile(state: GraphState) -> str:
-        """Determine if profile collection should continue."""
-        if state["error"]:
-            return "profile"
-        if state["next_action"] == "continue_profile":
-            return "profile"
-        if state["next_action"] == "retry_profile":
-            return "profile"
-        if state["next_action"] == "complete_profile":
-            return "profile"
-        return "discovery"
-    
-    def should_retry_discovery(state: GraphState) -> str:
-        """Determine if course discovery should be retried."""
-        if state["error"]:
-            return "discovery"
-        if state["next_action"] == "broaden_search":
-            return "discovery"
-        if state["next_action"] == "find_courses":
-            return "discovery"
-        if state["next_action"] == "retry_discovery":
-            return "discovery"
-        if state["next_action"] == "suitability":
-            return "suitability"
-        return "suitability"
-    
-    def should_validate_more(state: GraphState) -> str:
-        """Determine if more course validation is needed."""
-        if state["error"]:
-            return "suitability"
-        if state["next_action"] == "find_courses":
-            return "discovery"
-        if state["next_action"] == "validate_courses":
-            return "suitability"
-        if state["next_action"] == "retry_suitability":
-            return "suitability"
-        if state["next_action"] == "explore_careers":
-            return "career"
-        return "career"
-    
-    def should_end(state: GraphState) -> str:
-        """Determine if the workflow should end."""
-        if state["error"]:
-            return "career"
-        if state["next_action"] == "complete":
-            return "end"
-        if state["next_action"] == "explore_more_courses":
-            return "discovery"
-        if state["next_action"] == "validate_more_courses":
-            return "suitability"
-        if state["next_action"] == "update_profile":
-            return "profile"
-        return "career"
-    
-    # Add edges to the graph
-    workflow.add_edge("profile", should_continue_profile)
-    workflow.add_edge("discovery", should_retry_discovery)
-    workflow.add_edge("suitability", should_validate_more)
-    workflow.add_edge("career", should_end)
-    workflow.add_edge("end", lambda _: END)
-    
-    # Set entry point
-    workflow.set_entry_point("profile")
-    
-    # Compile the graph
-    app = workflow.compile()
-    
-    return app
+    history = history or []
+    conversation = add_messages(history, new_message)
+
+    # Start conversation with the profile agent
+    current_agent_key = "profile"
+
+    while True:
+        agent_messages = invoke_agent(current_agent_key, conversation)
+        conversation = add_messages(conversation, agent_messages)
+
+        # Find the last AIMessage in agent responses
+        ai_messages = [m for m in reversed(agent_messages) if isinstance(m, AIMessage)]
+        if not ai_messages:
+            # No AI response means end conversation or error
+            return agent_messages
+
+        last_ai_msg = ai_messages[0]
+
+        # If no tool calls, await user input
+        if not last_ai_msg.tool_calls:
+            user_ready_signal = interrupt(value="Ready for user input.")
+            user_msg = {
+                "role": "user",
+                "content": user_ready_signal,
+                "id": generate_uuid_from_text(user_ready_signal),
+            }
+            conversation = add_messages(conversation, [user_msg])
+            continue
+
+        # Determine next agent based on last tool call name
+        last_tool_call = last_ai_msg.tool_calls[-1]
+        tool_name = last_tool_call.get("name", "").lower()
+
+        if "profile" in tool_name:
+            current_agent_key = "profile"
+        elif "discovery" in tool_name:
+            current_agent_key = "discovery"
+        elif "suitability" in tool_name:
+            current_agent_key = "suitability"
+        elif "career" in tool_name:
+            current_agent_key = "career"
+        else:
+            # If tool call does not match known agents, end conversation
+            return agent_messages
+
 
 class Orchestrator:
-    """Main orchestrator for the course recommendation system."""
-    
+    """Wrapper class for managing the conversation lifecycle."""
+
     def __init__(self):
-        """Initialize the orchestrator."""
-        self.workflow = create_agent_graph()
-        self.context = ConversationContext()
-    
-    async def process_message(self, message: str) -> List[str]:
-        """Process a user message through the agent workflow.
+        self.thread_id = str(uuid.uuid4())
+        self.workflow = orchestrate_conversation
+
+    async def process(self, user_text: str) -> List[str]:
+        """
+        Processes incoming user text, running it through the orchestrator workflow.
         
         Args:
-            message (str): User's message
-            
+            user_text: Raw input from user.
+        
         Returns:
-            List[str]: List of agent responses
+            List of responses from agents.
         """
-        # Update chat history
-        self.context.chat_history.append({"role": "user", "content": message})
-        
-        # Prepare initial state
-        state = {
-            "context": self.context,
-            "messages": [],
-            "next_action": "start",
-            "error": None
+        input_message = {
+            "role": "user",
+            "content": user_text,
+            "id": generate_uuid_from_text(user_text),
         }
-        
-        # Run the workflow
-        final_state = await self.workflow.arun(state)
-        
-        # Update context with final state
-        self.context = final_state["context"]
-        
-        # Return agent messages
-        return [msg["content"] for msg in final_state["messages"]] 
+
+        thread_config = {"configurable": {"thread_id": self.thread_id}}
+        collected_responses = []
+
+        async for update in self.workflow.astream(
+            input_message,
+            config=thread_config,
+            stream_mode="updates",
+        ):
+            for _, messages in update.items():
+                if isinstance(messages, list) and messages:
+                    last_msg = messages[-1]
+                    # Support both dict and object message types
+                    content = (
+                        last_msg.get("content")
+                        if isinstance(last_msg, dict)
+                        else getattr(last_msg, "content", None)
+                    )
+                    if content:
+                        collected_responses.append(content)
+
+        return collected_responses
+
+graph = orchestrate_conversation

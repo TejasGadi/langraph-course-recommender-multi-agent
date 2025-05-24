@@ -1,131 +1,99 @@
-"""Student Profile Agent for collecting and managing student information."""
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+import json
+from typing import List, Dict, Optional
+from langchain_core.language_models import BaseChatModel
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import Tool
+from pydantic import BaseModel, Field
 
-from typing import Dict, List, Optional
-from src.agents.base_agent import BaseAgent
-from src.models.base_models import AgentResponse, ConversationContext, StudentProfile
+# Initialize LLM
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.4)
 
-class StudentProfileAgent(BaseAgent):
-    """Agent responsible for collecting and managing student profiles."""
-    
-    def __init__(self):
-        """Initialize the Student Profile Agent."""
-        super().__init__("StudentProfileAgent")
-        self.profile_collection_prompts = {
-            "initial": """You are a friendly educational advisor. The student has just started the conversation. 
-            Greet them warmly and ask about their current educational level and academic interests.
-            Current conversation history: {chat_history}""",
-            
-            "interests": """Based on the student's educational level, ask about their specific subject interests 
-            and what they hope to learn. Make sure to acknowledge their previous responses.
-            Current conversation history: {chat_history}""",
-            
-            "preferences": """Now that we know their course preferences, ask about their preferred course format 
-            (online/offline/hybrid) and time availability (e.g., evenings, weekends).
-            Current conversation history: {chat_history}""",
-            
-            "career_goals": """Finally, ask about their career aspirations and what they hope to achieve 
-            with these courses. Be encouraging and supportive.
-            Current conversation history: {chat_history}"""
-        }
-    
-    def _extract_profile_info(self, chat_history: List[Dict[str, str]]) -> Dict:
-        """Extract profile information from chat history.
-        
-        Args:
-            chat_history (List[Dict[str, str]]): Conversation history
-            
-        Returns:
-            Dict: Extracted profile information
-        """
-        # Create a prompt for the LLM to extract information
-        extraction_prompt = """Based on the following conversation, extract the student's profile information.
-        Format the response as a JSON object with these fields:
-        - education_level
-        - academic_background
-        - interests
-        - preferred_mode
-        - availability
-        - career_goals
-        
-        Conversation:
-        {chat_history}
-        
-        Only include information that was explicitly mentioned. If a field wasn't discussed, leave it as null.
-        """
-        
-        messages = self._create_prompt(extraction_prompt, {"chat_history": str(chat_history)})
-        response = self.llm.invoke(messages)
-        
-        try:
-            # The response should be in JSON format
-            profile_data = eval(response.content)
-            return profile_data
-        except:
-            return {}
-    
-    def _determine_next_prompt(self, profile_data: Dict) -> Optional[str]:
-        """Determine which prompt to use next based on missing information.
-        
-        Args:
-            profile_data (Dict): Current profile information
-            
-        Returns:
-            Optional[str]: Next prompt key or None if profile is complete
-        """
-        if not profile_data.get('education_level'):
-            return "initial"
-        elif not profile_data.get('interests'):
-            return "interests"
-        elif not profile_data.get('preferred_mode') or not profile_data.get('availability'):
-            return "preferences"
-        elif not profile_data.get('career_goals'):
-            return "career_goals"
-        return None
-    
-    async def process(self, context: ConversationContext) -> AgentResponse:
-        """Process the current context and collect student profile information.
-        
-        Args:
-            context (ConversationContext): Current conversation context
-            
-        Returns:
-            AgentResponse: Agent's response with next steps
-        """
-        # Extract current profile information
-        profile_data = self._extract_profile_info(context.chat_history)
-        
-        # Determine which information we still need
-        next_prompt_key = self._determine_next_prompt(profile_data)
-        
-        if next_prompt_key is None:
-            # Profile is complete, create StudentProfile object
-            try:
-                student_profile = StudentProfile(**profile_data)
-                context = self.update_context(context, 
-                                           student_profile=student_profile,
-                                           current_phase="profile_complete")
-                return self._format_response(
-                    success=True,
-                    message="Great! I have all the information I need. Let me start looking for courses that match your profile.",
-                    data={"profile": profile_data},
-                    next_action="find_courses"
-                )
-            except Exception as e:
-                return self._format_response(
-                    success=False,
-                    message="I had trouble processing your information. Could you please clarify your responses?",
-                    data={"error": str(e)},
-                    next_action="retry_profile"
-                )
-        
-        # Get the next prompt and generate response
-        prompt = self.profile_collection_prompts[next_prompt_key]
-        messages = self._create_prompt(prompt, {"chat_history": str(context.chat_history)})
-        response = self.llm.invoke(messages)
-        
-        return self._format_response(
-            success=True,
-            message=response.content,
-            data={"current_profile": profile_data},
-            next_action="continue_profile"
-        ) 
+
+# Input schema for extract_student_profile tool
+class ExtractProfileInput(BaseModel):
+    chat_history: List[Dict[str, str]] = Field(
+        ..., description="List of message dictionaries with roles and content representing the conversation history."
+    )
+
+def extract_student_profile(chat_history: List[Dict[str, str]]) -> dict:
+    """Extract structured student profile data from conversation history."""
+    prompt = (
+        "Extract the student's profile information from the chat history below.\n\n"
+        "Return a JSON object with the following fields:\n"
+        "- education_level\n"
+        "- academic_background\n"
+        "- interests\n"
+        "- preferred_mode\n"
+        "- availability\n"
+        "- career_goals\n\n"
+        "Only include what is explicitly mentioned. Use null for missing fields.\n\n"
+        "Chat History:\n"
+        f"{json.dumps(chat_history, indent=2)}"
+    )
+    response = llm.invoke([{"role": "user", "content": prompt}])
+    try:
+        return json.loads(response.content)
+    except Exception:
+        return {}
+
+# Tool: Determine which field is missing
+# Input schema for determine_missing_field tool
+class DetermineMissingFieldInput(BaseModel):
+    profile: Dict[str, Optional[str]] = Field(
+        ..., description="Partial or full student profile dictionary to determine missing fields."
+    )
+
+
+def determine_missing_field(profile: Dict[str, Optional[str]]) -> str:
+    """Determine which profile section to ask next based on missing fields."""
+    if not profile.get("education_level"):
+        return "initial"
+    elif not profile.get("interests"):
+        return "interests"
+    elif not profile.get("preferred_mode") or not profile.get("availability"):
+        return "preferences"
+    elif not profile.get("career_goals"):
+        return "career_goals"
+    return "complete"
+
+
+tools=[
+    Tool(
+        name="extract_student_profile",
+        func=extract_student_profile,
+        description="Extract structured student profile data from a conversation chat history.",
+        args_schema=ExtractProfileInput
+    ),
+    Tool(
+        name="determine_missing_field",
+        func=determine_missing_field,
+        description="Determine which profile section is missing and should be asked next.",
+        args_schema=DetermineMissingFieldInput
+    )
+]
+
+# StudentProfileAgent
+class StudentProfileAgent:
+    def __init__(self, llm: BaseChatModel = llm, tools: List[Tool] = tools):
+        self.agent = create_react_agent(
+            model=llm,
+            tools=tools,
+            prompt=(
+                "You are a student profiling agent. Your job is to interact with students "
+                "to gather their academic and career profile. Ask questions to extract:\n"
+                "- education level\n"
+                "- academic background\n"
+                "- interests\n"
+                "- preferred learning mode (online/offline)\n"
+                "- availability (schedule/frequency)\n"
+                "- career goals\n\n"
+                "Use tools like `extract_student_profile` to extract info from chat history, "
+                "and `determine_missing_field` to guide what to ask next. Once the profile is complete, "
+                "you must indicate that the handoff to the recommendation agent can happen."
+            )
+        )
+
+    def as_runnable(self):
+        return self.agent
