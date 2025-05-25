@@ -1,0 +1,15 @@
+{
+  "name": "Tejas Gadi",
+  "educational_level": "High School",
+  "age": 20,
+  "course_description": "I am looking for Linear Algebra courses.",
+  "course_mode": "online",
+  "daily_hours": 0,
+  "preferred_timing": "evenings",
+  "max_duration_months": 0,
+  "language": [
+    "English"
+  ],
+  "certification_needed": false,
+  "location_preference": "No preferences for location."
+}
